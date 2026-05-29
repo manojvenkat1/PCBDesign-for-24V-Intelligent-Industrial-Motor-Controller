@@ -1,0 +1,227 @@
+═══════════════════════════════════════════════════════
+  ACCIO ROBOTICS — CONTROLS INTERN TASK
+  FIRMWARE PSEUDOCODE
+  Candidate: Manoj V
+═══════════════════════════════════════════════════════
+
+ASSUMPTIONS:
+  - ESP32-WROOM-32E chosen (ARM-class, built-in WiFi)
+  - DRV8874 motor driver (PWM on IN1, DIR on IN2)
+  - Quadrature encoder on IO34/IO35 (500 PPR)
+  - INA219 for current + voltage (I2C at 0x40)
+  - MCP9700AT for temperature (analog ADC)
+  - Limit switches: active LOW (hardware pull-up)
+  - Velocity control = inner PID loop
+  - Position control = outer P-loop → generates velocity setpoint
+  - Manual intervention = encoder moves when motor stopped > threshold
+  - All WiFi commands come as JSON over WebSocket
+
+
+───────────────────────────────────────────────────────
+  MODULE: SETUP  (runs once at power-on)
+───────────────────────────────────────────────────────
+
+PROCEDURE setup():
+    init Serial at 115200 baud
+    set LS1_PIN, LS2_PIN as INPUT
+    init PWM channel: freq=20kHz, resolution=8-bit, attach to GPIO12
+    set DIR_PIN as OUTPUT
+    attach encoder ISR to GPIO34 (CHANGE) and GPIO35 (CHANGE)
+    init I2C on SDA=GPIO21, SCL=GPIO22
+    init INA219 at address 0x40
+    connect to WiFi using SSID and PASSWORD from config
+    if WiFi connected:
+        mount SPIFFS filesystem
+        serve /data/index.html at GET "/"
+        attach WebSocket handler at "/ws"
+        start HTTP server on port 80
+    call HOMING ROUTINE
+    sync PID gains
+    record start time
+
+
+───────────────────────────────────────────────────────
+  MODULE: HOMING ROUTINE
+───────────────────────────────────────────────────────
+
+PROCEDURE motorHome():
+    PHASE 1 — move toward LS1 at low PWM (speed=60/255)
+        set DIR = HOMING direction
+        write PWM = HOMING_PWM
+        WAIT until LS1 is triggered OR timeout 15s
+        if timeout: print error, RETURN
+        stop motor
+        reset encoderCount = 0  ← this is the HOME position
+
+    PHASE 2 — back off 5 mm from LS1
+        reset encoder
+        reverse direction
+        write PWM = HOMING_PWM
+        WAIT until encoder count >= (5mm / MM_PER_PULSE)
+        stop motor
+
+    PHASE 3 — drive to LS2, measure full travel
+        reset encoder
+        set direction = forward
+        write PWM = HOMING_PWM
+        WAIT until LS2 triggered OR timeout 30s
+        if timeout: print error, RETURN
+        stop motor
+        motorMaxMM = encoderGetMM()   ← total travel distance
+
+    PHASE 4 — return to LS1 (home)
+        set DIR = HOMING direction
+        write PWM = HOMING_PWM
+        WAIT until LS1 triggered OR timeout 30s
+        stop motor
+        reset encoderCount = 0
+        motorHomed = TRUE
+
+
+───────────────────────────────────────────────────────
+  MODULE: ENCODER ISR  (hardware interrupt, IRAM_ATTR)
+───────────────────────────────────────────────────────
+
+ISR encoderISR_A():    ← fires on every edge of channel A
+    enter critical section
+    read A = GPIO34 state
+    read B = GPIO35 state
+    if A XOR B == 0:  encoderCount += 1   (clockwise)
+    else:             encoderCount -= 1   (counter-clockwise)
+    exit critical section
+
+ISR encoderISR_B():    ← fires on every edge of channel B
+    enter critical section
+    read A, B
+    if A XOR B == 1:  encoderCount += 1
+    else:             encoderCount -= 1
+    exit critical section
+
+NOTE: Use portENTER_CRITICAL_ISR() on ESP32 — this is
+      mandatory for shared volatile variables with RTOS tasks
+
+
+───────────────────────────────────────────────────────
+  MODULE: PID CONTROLLER  (velocity loop)
+───────────────────────────────────────────────────────
+
+FUNCTION pid.compute(setpoint, measured, dt):
+    error     = setpoint - measured
+
+    if |error| > DEADBAND_RPM:         ← avoid integral drift at near-zero error
+        integral += error × dt
+
+    integral  = clamp(integral, -INTEGRAL_MAX, +INTEGRAL_MAX)   ← anti-windup
+
+    derivative = (error - prevError) / dt
+    prevError  = error
+
+    output = Kp×error + Ki×integral + Kd×derivative
+    output = clamp(output, 0, 255)     ← map to PWM range
+    RETURN output
+
+NOTE: Start tuning with Kp=1.2, Ki=0.6, Kd=0.05
+      Use Arduino Serial Plotter to visualise velocity response
+      Ziegler-Nichols: increase Kp until oscillation, then
+        Kp=0.6Ku, Ki=2Kp/Tu, Kd=KpTu/8
+
+
+───────────────────────────────────────────────────────
+  MODULE: MAIN CONTROL LOOP  (10 ms tick)
+───────────────────────────────────────────────────────
+
+PROCEDURE loop():
+    cleanup stale WebSocket clients
+
+    if homingRequested == TRUE:
+        stop motor, call motorHome(), reset
+        RETURN
+
+    if (now - lastLoopTime) < 10ms: RETURN   ← gate the tick
+    dt = (now - lastLoopTime) / 1000
+    lastLoopTime = now
+
+    ── Step 1: Read encoder
+    currentVelocityRPM = (Δencodercount / PPR×4) / dt × 60
+    currentPositionMM  = encoderCount × MM_PER_PULSE
+
+    ── Step 2: Limit switch check (hard stop)
+    ls1 = read GPIO36
+    ls2 = read GPIO39
+    if ls1 is LOW AND direction == HOMING_DIR:
+        stop motor, RETURN
+    if ls2 is LOW AND direction != HOMING_DIR:
+        stop motor, RETURN
+
+    ── Step 3: Manual intervention detection
+    if motor is stopped (targetVelocity == 0):
+        delta = |encoderCount - expectedPulses|
+        if delta > MANUAL_THRESHOLD:
+            manualFlag = TRUE
+            expectedPulses = encoderCount   ← accept new position
+            send alert via WebSocket
+    else:
+        expectedPulses = encoderCount       ← track running position
+
+    ── Step 4: If stop commanded → stay stopped
+    if stopRequested: stop motor, RETURN
+
+    ── Step 5: Outer position loop (if in position mode)
+    if positionMode == TRUE:
+        positionError = targetPositionMM - currentPositionMM
+        if |positionError| < 0.1mm:
+            stop motor, positionMode = FALSE
+        else:
+            set direction based on sign of error
+            velocitySetpoint = clamp(|positionError| × Kp_pos × 10, 5, 500) RPM
+
+    ── Step 6: PID inner loop → PWM
+    if velocitySetpoint > 0:
+        pwm = pid.compute(velocitySetpoint, |currentVelocityRPM|, dt)
+        write PWM to GPIO12
+        write DIR to GPIO13
+    else:
+        write PWM = 0
+        reset PID integral
+
+    ── Step 7: Read sensors every 5 ticks (50ms)
+    if sensorTick >= 5:
+        currentMA  = INA219.getCurrent_mA()
+        busVoltage = INA219.getBusVoltage_V()
+        supplyV    = ADC(GPIO33) × (R_H+R_L)/R_L × (3.3/4095)
+        tempC      = (ADC(GPIO32)×3.3/4095 - 0.5) / 0.01
+        sensorTick = 0
+
+    ── Step 8: Broadcast JSON to WebSocket (every 50ms)
+    if (now - lastBroadcast) >= 50ms:
+        send JSON {vel, pos, curr, busV, supV, temp, ls1, ls2, manual, homed}
+
+
+───────────────────────────────────────────────────────
+  MODULE: WEBSOCKET COMMAND HANDLER  (async callback)
+───────────────────────────────────────────────────────
+
+ON WebSocket message received (JSON string):
+    parse JSON
+    switch cmd:
+        "vel"  → targetVelocityRPM = val (0–3000 RPM)
+                 positionMode = FALSE
+        "pos"  → targetPositionMM = val (0–motorMaxMM)
+                 positionMode = TRUE
+        "fwd"  → motorDirection = HIGH (forward)
+        "rev"  → motorDirection = LOW  (reverse)
+        "stop" → stopRequested = TRUE, targetVelocity = 0, stop motor
+        "home" → homingRequested = TRUE
+        "tune" → update Kp, Ki, Kd from JSON fields, reset PID
+
+
+───────────────────────────────────────────────────────
+  SENSOR FORMULAE REFERENCE
+───────────────────────────────────────────────────────
+
+Current (mA):   INA219 getCurrent_mA()         ← internal calculation
+Voltage (V):    INA219 getBusVoltage_V() + shunt_V
+Supply (V):     ADC_raw / 4095 × 3.3 × (110k/10k)  = raw × 0.0363
+Temperature:    (ADC_V - 0.500) / 0.010        ← MCP9700AT datasheet
+Position (mm):  encoderCount × (LEAD_MM / (PPR×4))
+Velocity (RPM): (Δcount / (PPR×4)) / dt × 60
