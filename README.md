@@ -71,7 +71,7 @@ The PCB layout was developed with attention to component placement, routing effi
 ## 🔌 Schematic Diagram
 
 <p align="center">
-  <img src="schematic layout.png"
+  <img src="schematic layout .png"
        alt="24V Intelligent Industrial Motor Controller Schematic Diagram"
        width="800">
 </p>
