@@ -58,9 +58,13 @@ The PCB layout was developed with attention to component placement, routing effi
 
 ### PCB Layout
 
-Add your actual PCB layout image below.
+## 🖥️ PCB Layout
 
-![24V Intelligent Industrial Motor Controller PCB Layout](images/motor-controller-pcb.png)
+<p align="center">
+  <img src="pcb.png"
+       alt="24V Intelligent Industrial Motor Controller PCB Layout"
+       width="800">
+</p>
 
 ### Schematic Diagram
 
