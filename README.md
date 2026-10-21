@@ -68,11 +68,13 @@ The PCB layout was developed with attention to component placement, routing effi
 
 ### Schematic Diagram
 
-Add your exported schematic image below.
+## 🔌 Schematic Diagram
 
-![24V Intelligent Industrial Motor Controller Schematic](images/motor-controller-schematic.png)
-
-> Replace the example image paths with the actual filenames in your repository. If the schematic and PCB images are stored in the repository root, use their root-relative paths instead.
+<p align="center">
+  <img src="schematic-layout.png"
+       alt="24V Intelligent Industrial Motor Controller Schematic Diagram"
+       width="800">
+</p>
 
 ## ⚡ System Architecture
 
